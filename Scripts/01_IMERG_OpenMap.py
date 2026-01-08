@@ -1,149 +1,119 @@
 # -*- coding: utf-8 -*-
 """
-Created on Mon Jun 26 12:44:53 2023
+IMERG Precipitation Map Generation.
 
-@author: PatricioJavier
+Reads raw IMERG HDF5 files, extracts 'precipitationUncal', 
+clips to basin, converts rate to accumulation, and generates a map.
+
+Author: Patricio Luna Abril
 """
+
 import os
-import pandas as pd
-import geopandas as gpd
-import matplotlib.pyplot as plt
-import h5py
-import numpy as np
-import cartopy.crs as ccrs
-from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
-import matplotlib.ticker as mticker
-import pyproj
-from pyproj import CRS
-import xarray as xr
-import rasterio
-import rasterio.mask
-from shapely.geometry import mapping
-import rioxarray
 import time
 import pickle
+import warnings
+import h5py
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import geopandas as gpd
+import xarray as xr
+import rioxarray
+from shapely.geometry import mapping
+from pyproj import CRS
 
+warnings.filterwarnings('ignore')
 
-def filter_files_IMERG(files, start_date, end_date):
-    """
-    Filter a list of files based on a date range.
+# FLAGS
+RUN_PROCESS = True  
+SAVE_OUTPUT = True
 
-    Parameters:
-    - files: List of file names.
-    - start_date: Starting date (numeric format, e.g., 2019122003).
-    - end_date: Ending date (numeric format, e.g., 2019122021).
+# PATHS
+BASE_DIR = os.getcwd()
+SHAPEFILE_PATH = os.path.join(BASE_DIR, 'Data', 'Shapes_MSF', 'Jubones', 'jubonesMSF_catch.shp')
+RAW_DATA_DIR = r'C:\Users\patri\OneDrive\Documentos\MAESTRIA_HIDROLOGIA_UCUENCA\DataFusion_TESIS\Datos_Caudal\Data\Precipitation\IMERG' 
+PICKLE_OUTPUT = os.path.join(BASE_DIR, 'Data', 'pickle_IMERG', 'IMERG_Accumul_pcp_2019_GIT.p')
 
-    Returns:
-    - List of filtered file names.
-    """
+# Date Range
+START_DATE = pd.Timestamp("2019-01-01 00:00")
+END_DATE = pd.Timestamp("2019-01-01 23:30")
 
-    filtered_files = []
-    startdate_int = int(start_date.strftime('%Y%m%d%H%M'))
-    enddate_int = int(end_date.strftime('%Y%m%d%H%M'))
+def filter_imerg_files(file_list, start_date, end_date):
+    filtered = []
+    start_int = int(start_date.strftime('%Y%m%d%H%M'))
+    end_int = int(end_date.strftime('%Y%m%d%H%M'))
 
-    for filename in files:
-        # Extract date components from the filename
-        # Assuming the format is YYYYMMDD.HH.nc
-        file_year = int(filename[23:27])
-        file_month = int(filename[27:29])
-        file_day = int(filename[29:31])
-        file_hour = int(filename[33:37])
+    for filename in file_list:
+        try:
+            # Format: ...20220402-S000000...
+            f_year = int(filename[23:27])
+            f_month = int(filename[27:29])
+            f_day = int(filename[29:31])
+            f_hour = int(filename[33:37])
+            f_date = int(f"{f_year:04d}{f_month:02d}{f_day:02d}{f_hour:04d}")
 
-        # Convert the extracted components to a single numeric date
-        file_date = int(f"{file_year:04d}{file_month:02d}{file_day:02d}{file_hour:04d}")
+            if start_int <= f_date <= end_int:
+                filtered.append(filename)
+        except Exception:
+            continue
+    return sorted(filtered)
 
-        if startdate_int <= file_date <= enddate_int:
-            filtered_files.append(filename)
+if __name__ == "__main__":
+    import pandas as pd 
 
-    return filtered_files
+    basin_shp = gpd.read_file(SHAPEFILE_PATH).to_crs(epsg=4326)
+    accum_data = None
 
-###Open the Jubones basin shapefile
-jubones_shp = gpd.read_file(r'Data\Shapes_MSF\Jubones\jubonesMSF_catch.shp')
-jubones_geometry = jubones_shp.geometry.iloc[0]  #Get the boundary geometry
-jubones_shp.plot() #To plot the shp
-##Projecting the shapefile to EPSG: 4326
-source_crs = CRS.from_string('+proj=utm +zone=30 +datum=WGS84 +units=m +no_defs') #Source CRS: XY coordinates
-target_crs = CRS.from_epsg(4326) #To what CRS is going to be projected
-jubones_proj = jubones_shp.to_crs(target_crs)
-jubones_proj.plot() #To plot the shp
-ext = jubones_proj.total_bounds #It creates an array with the bounds in the form (minx, miny, maxx, maxy)
+    if RUN_PROCESS:
+        if os.path.exists(RAW_DATA_DIR):
+            files = os.listdir(RAW_DATA_DIR)
+            target_files = filter_imerg_files(files, START_DATE, END_DATE)
+            
+            list_arrays = []
+            print(f"Processing {len(target_files)} files...")
+            
+            for i, filename in enumerate(target_files):
+                if (i+1) % 50 == 0: print(f"Processing {i+1}...")
+                
+                path = os.path.join(RAW_DATA_DIR, filename)
+                try:
+                    with h5py.File(path, 'r') as f:
+                        precip = f['Grid/precipitationUncal'][0][:][:]
+                        precip = np.transpose(precip) # Transpose to (Lat, Lon)
+                        lats = f['Grid/lat'][:]
+                        lons = f['Grid/lon'][:]
+                        
+                    da = xr.DataArray(precip, dims=('lat', 'lon'), coords={'lat': lats, 'lon': lons})
+                    da.rio.set_spatial_dims(x_dim="lon", y_dim="lat", inplace=True)
+                    da.rio.write_crs("epsg:4326", inplace=True)
+                    
+                    da_clipped = da.rio.clip(basin_shp.geometry.apply(mapping), basin_shp.crs, all_touched=True)
+                    list_arrays.append(da_clipped)
+                except Exception as e:
+                    print(f"Error {filename}: {e}")
+            
+            if list_arrays:
+                print("Accumulating...")
+                combined = xr.concat(list_arrays, dim='time')
+                # Filter negatives
+                combined = combined.where(combined >= 0)
+                # Sum and convert to mm (Rate * 0.5h)
+                accum_data = combined.sum(dim='time', skipna=True) * 0.5
+                
+                if SAVE_OUTPUT:
+                    os.makedirs(os.path.dirname(PICKLE_OUTPUT), exist_ok=True)
+                    with open(PICKLE_OUTPUT, "wb") as f:
+                        pickle.dump(accum_data, f)
+        else:
+            print(f"Directory not found: {RAW_DATA_DIR}")
+    else:
+        if os.path.exists(PICKLE_OUTPUT):
+            with open(PICKLE_OUTPUT, "rb") as f:
+                accum_data = pickle.load(f)
 
-#Set of files in the directory
-file_list = os.listdir(r'Data\Test_IMERG')
-direccion_principal = r'Data\Test_IMERG'
-folder = os.getcwd()
-
-# Example usage
-# Specify the date range
-start_date = pd.Timestamp("2022-04-02 00:00")
-end_date = pd.Timestamp("2022-04-02 23:30")
-
-filtered_files = filter_files_IMERG(file_list, start_date, end_date)
-list_of_Files = []
-list_arrays = []
-
-# start_time = time.time()
-## Verification of uncorrupted files for its processing
-for index, item in enumerate(filtered_files):
-    # index = 0
-    # item = list_of_Files[0]
-    cpth = os.path.join(direccion_principal, item) #To get the current path of the file
-    print(index+1, 'out of', len(filtered_files))
-    
-    try:
-        f = h5py.File(cpth, 'r')
-    
-    except (IOError, EOFError) as e:
-        
-    #     # Catch specific errors related to file reading or handling
-        continue
-
-    groups = [ x for x in f.keys() ]
-    gridMembers = [ x for x in f['Grid'] ]
-    # print(groups)
-    # print(gridMembers)
-    precip = f['Grid/precipitationUncal'][0][:][:]
-    precip = np.transpose(precip)
-    theLats = f['Grid/lat'][:]
-    theLons = f['Grid/lon'][:]
-    x, y = np.float32(np.meshgrid(theLons, theLats))
-    
-    pcp_array = xr.DataArray(precip, dims=('lat', 'lon'), coords={'lat' : theLats, 'lon' : theLons})
-    pcp_array.rio.set_spatial_dims(x_dim="lon", y_dim="lat", inplace=True) #Define spatial dimensions based on longitude and latitude
-    pcp_array.rio.write_crs("epsg:4326", inplace=True) #Define the CRS for the data array
-    pcp_array = pcp_array.rio.clip(jubones_proj.geometry.apply(mapping), jubones_proj.crs, 
-                                   all_touched=True) #Clipping the data array to the study area
-    
-    list_arrays.append(pcp_array) #Each ds is saved in the list
-
-#Operations of SUM for the list of data arrays
-combined_data_array = np.stack(list_arrays, axis=0) #concatenate the data
-data_non_negative = np.where(combined_data_array >= 0, combined_data_array, np.nan)
-cumulative_pcp = np.cumsum(data_non_negative, axis=0)
-cumul_pcp_mmhr = cumulative_pcp*0.5
-cumul_pcp_mmhr = cumul_pcp_mmhr[-1]
-cumul_pcp_mmhr = xr.DataArray(cumul_pcp_mmhr, dims=('lat', 'lon'), coords={'lat' : pcp_array.lat, 'lon' : pcp_array.lon})
-cumul_pcp_mmhr
-# Save as pickle variable 
-# pickle.dump(cumul_pcp_mmhr, open(folder+"\Data\pickle_IMERG\IMERG_Accumul_pcp_2019.p", "wb" ) )
-cumulative_sum_pick = pickle.load( open( folder+"\Data\pickle_IMERG\IMERG_Accumul_pcp_2022.p", "rb" ) )
-
-fig, ax = plt.subplots(figsize=(10, 10))
-cumulative_sum_pick.plot(ax=ax, cmap = 'GnBu', vmin = 0, vmax = 1500) #Precipitation map
-jubones_proj.boundary.plot(ax=ax, color='black') #Projected shp of the basin
-plt.title('IMERG-ER Cumulative Precipitation Map 2022', fontsize=20)
-plt.xlabel('Longitude [degrees east]', fontsize = 18)
-plt.ylabel('Latitude [degrees north]', fontsize = 18)
-plt.xticks(fontsize = 16)
-plt.yticks(fontsize = 16)
-plt.show()
-print('Precipitación máxima = ',cumul_pcp_mmhr.max().values,'mm')
-print('Precipitación promedio = ',cumul_pcp_mmhr.mean().values,'mm')
-print('Precipitación mínima = ',cumul_pcp_mmhr.min().values,'mm')
-
-
-# end_time = time.time()
-# elapsed_time = end_time - start_time
-# print(f"Elapsed time: {elapsed_time:.2f} seconds")
-
-fig.savefig('Results/Cumulative_Precipitation_IMERG/newIMERG_cumul_pcp_2022.png', bbox_inches='tight', pad_inches = 0.1)
+    if accum_data is not None:
+        fig, ax = plt.subplots(figsize=(10, 10))
+        accum_data.plot(ax=ax, cmap='GnBu', cbar_kwargs={'label': 'mm'})
+        basin_shp.boundary.plot(ax=ax, color='black')
+        plt.title('IMERG Cumulative Precipitation', fontsize=16)
+        plt.show()
