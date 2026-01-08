@@ -1,138 +1,154 @@
 # -*- coding: utf-8 -*-
 """
-Created on Mon Jun 26 12:44:53 2023
+MSWEP Precipitation Map Generation.
 
-@author: PatricioJavier
+This script reads MSWEP NetCDF files, clips them to the basin,
+accumulates precipitation, and generates a map.
+
+Author: Patricio Luna Abril
 """
-#%% LIBRARIES & FUNCTIONS
+
 import os
+import time
+import pickle
+import warnings
 import pandas as pd
-import netCDF4 as nc
-import matplotlib.pyplot as plt
-import numpy as np
 import xarray as xr
 import geopandas as gpd
-import pyproj
-from pyproj import CRS
-import rasterio
-import rasterio.mask
+import matplotlib.pyplot as plt
 from shapely.geometry import mapping
-import rioxarray
-import pickle
-import time
+from pyproj import CRS
 
-def filter_files_MSWEP(files, start_date, end_date):
-    """
-    Filter a list of files based on a date range.
+warnings.filterwarnings('ignore')
 
-    Parameters:
-    - files: List of file names.
-    - start_date: Starting date (numeric format, e.g., 2019122003).
-    - end_date: Ending date (numeric format, e.g., 2019122021).
+# ==========================================
+# CONFIGURATION FLAGS
+# ==========================================
+# Set to TRUE to re-read NetCDF files and recalculate accumulation.
+# Set to FALSE to load existing pickle data.
+RUN_PROCESS = True 
 
-    Returns:
-    - List of filtered file names.
-    """
+# Save the calculated result to pickle?
+SAVE_OUTPUT = True
 
-    filtered_files = []
+# ==========================================
+# PATHS & DATES
+# ==========================================
+BASE_DIR = os.getcwd()
+SHAPEFILE_PATH = os.path.join(BASE_DIR, 'Data', 'Shapes_MSF', 'Jubones', 'jubonesMSF_catch.shp')
+RAW_DATA_DIR = r'C:\Users\patri\OneDrive\Documentos\MAESTRIA_HIDROLOGIA_UCUENCA\DataFusion_TESIS\Datos_Caudal\Data\Precipitation\MSWEP' # Adjust if needed
+PICKLE_OUTPUT_DIR = os.path.join(BASE_DIR, 'Data', 'pickle_MSWEP_2019_GIT')
 
-    for filename in files:
-        # Extract date components from the filename
-        # Assuming the format is YYYYMMDD.HH.nc
-        file_year = int(filename[:4])
-        file_day = int(filename[4:7])
-        file_hour = int(filename[8:10])
+# Numeric Date Range: YYYYJJJHH (Year, Julian Day, Hour)
+START_DATE_INT = 201900100 
+END_DATE_INT = 201900200 
 
-        # Convert the extracted components to a single numeric date
-        file_date = int(f"{file_year:04d}{file_day:03d}{file_hour:02d}")
+# ==========================================
+# FUNCTIONS
+# ==========================================
+def filter_mswep_files(file_list, start_int, end_int):
+    """Filters files based on YYYYJJJHH integer format."""
+    filtered = []
+    for fname in file_list:
+        try:
+            # Filename format assumption: YYYYJJJ.HH.nc
+            f_year = int(fname[:4])
+            f_day = int(fname[4:7])
+            f_hour = int(fname[8:10])
+            f_date = int(f"{f_year:04d}{f_day:03d}{f_hour:02d}")
+            
+            if start_int <= f_date <= end_int:
+                filtered.append(fname)
+        except ValueError:
+            continue
+    return filtered
 
-        if start_date <= file_date <= end_date:
-            filtered_files.append(filename)
-
-    return filtered_files
-
-#%% LOADING THE DATA
-# Add the shapefile of Jubones basin
-jubones_shp = gpd.read_file(r'C:\Users\patri\OneDrive\Documentos\MAESTRIA_HIDROLOGIA_UCUENCA\DataFusion_TESIS\Datos_Caudal\Data\Shapes_MSF\Jubones\jubonesMSF_catch.shp')
-##Get the boundary geometry
-jubones_geometry = jubones_shp.geometry.iloc[0]  # Assuming only one geometry in the shapefile
-jubones_shp.plot() #To plot the shp
-
-#List of NetCDF files in the directory
-    #MSWEP v2.2: D:\MSWEP_v220
-    #MSWEP v2.8: D:\MSWEP_v280
-file_list = os.listdir(r'D:\MSWEP_v280') 
-direccion_principal = r'D:\MSWEP_v280'
-folder = os. getcwd()
-# Example usage
-start_date = 20190100 # Numeric format: YYYYJDHH
-end_date = 202336521  # Numeric format: YYYYJDHH
-
-filtered_files = filter_files_MSWEP(file_list, start_date, end_date)
-
-##Projecting the shapefile to EPSG: 4326
-source_crs = CRS.from_string('+proj=utm +zone=30 +datum=WGS84 +units=m +no_defs') #Source CRS: XY coordinates
-target_crs = CRS.from_epsg(4326) #To what CRS is going to be projected
-jubones_proj = jubones_shp.to_crs(target_crs)
-
-#%% TO READ, CLIP AND CONCATENATE THE DATA
-list_arrays = []
-
-### FOR loop to clip the netcdf file and extract the pixels that intersect the shp
-start_time = time.time()
-for i in range(0, len(filtered_files)) :
-    print(i+1, 'out of', len(filtered_files))
-    path = os.path.join(direccion_principal, filtered_files[i]) #To get the list of files in the directory
-    ds = xr.open_dataset(path) #Open each file as dataset using xarray
-    ds = xr.DataArray(data=ds['precipitation']) #Convert to Data Array taking precipitation values
-    ds.rio.set_spatial_dims(x_dim="lon", y_dim="lat", inplace=True) #Define spatial dimensions based on longitude and latitude
-    ds.rio.write_crs("epsg:4326", inplace=True) #Define the CRS for the data array
-    ds_1 = ds.rio.clip(jubones_shp.geometry.apply(mapping), jubones_shp.crs, all_touched=True) #Clipping the data array to the study area
+def process_mswep_data(files, raw_dir, basin_gdf):
+    """Reads, clips, and accumulates NetCDF data."""
+    print(f"Starting processing of {len(files)} files...")
+    start_time = time.time()
     
+    list_arrays = []
     
+    for i, filename in enumerate(files):
+        if (i+1) % 50 == 0: print(f"Processing {i+1}/{len(files)}")
+        
+        path = os.path.join(raw_dir, filename)
+        try:
+            with xr.open_dataset(path) as ds:
+                # Extract precipitation
+                da = ds['precipitation']
+                da.rio.set_spatial_dims(x_dim="lon", y_dim="lat", inplace=True)
+                da.rio.write_crs("epsg:4326", inplace=True)
+                
+                # Clip
+                da_clipped = da.rio.clip(basin_gdf.geometry.apply(mapping), basin_gdf.crs, all_touched=True)
+                list_arrays.append(da_clipped)
+        except Exception as e:
+            print(f"Error reading {filename}: {e}")
+            continue
+
+    print("Concatenating and accumulating...")
+    combined = xr.concat(list_arrays, dim='time')
+    # Accumulate (skipna=True treats NaNs as 0 during sum)
+    total_accum = combined.sum(dim='time', skipna=True)
     
-    list_arrays.append(ds_1) #Each ds is saved in the list
+    # Post-process: Mask 0 as NaN if desired (as per original script)
+    final_accum = total_accum.where(total_accum != 0, other=float('nan'))
+    
+    print(f"Elapsed time: {time.time() - start_time:.2f} s")
+    return final_accum
 
-#Accumulation from the files of the list of data arrays
-combined_data_array = xr.concat(list_arrays, dim='time') #concatenate the data 
-cumulative_sum = combined_data_array.sum(dim='time', skipna=True)
-cumsum_w_nan = cumulative_sum.where(cumulative_sum != 0, other=float('nan'))
-print(cumsum_w_nan)
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
+if __name__ == "__main__":
+    
+    # 1. Load Shapefile
+    print("Loading shapefile...")
+    basin_shp = gpd.read_file(SHAPEFILE_PATH)
+    target_crs = CRS.from_epsg(4326)
+    basin_proj = basin_shp.to_crs(target_crs)
+    
+    accumulated_data = None
 
-end_time = time.time()
-elapsed_time = end_time - start_time
-print(f"Elapsed time: {elapsed_time:.2f} seconds")
+    # 2. Processing Block
+    if RUN_PROCESS:
+        if os.path.exists(RAW_DATA_DIR):
+            all_files = os.listdir(RAW_DATA_DIR)
+            target_files = filter_mswep_files(all_files, START_DATE_INT, END_DATE_INT)
+            
+            if target_files:
+                accumulated_data = process_mswep_data(target_files, RAW_DATA_DIR, basin_proj)
+                
+                if SAVE_OUTPUT:
+                    os.makedirs(PICKLE_OUTPUT_DIR, exist_ok=True)
+                    # Note: Original filename had 2019-2023, adjust as needed
+                    out_path = os.path.join(PICKLE_OUTPUT_DIR, "MSWEP_Cumul_pcp_calculated.p")
+                    with open(out_path, "wb") as f:
+                        pickle.dump(accumulated_data, f)
+                    print(f"Saved to {out_path}")
+            else:
+                print("No files found in range.")
+        else:
+            print(f"Directory not found: {RAW_DATA_DIR}")
+            
+    else:
+        # Load existing
+        pickle_path = os.path.join(PICKLE_OUTPUT_DIR, "MSWEP_Cumul_pcp_calculated.p")
+        if os.path.exists(pickle_path):
+            print("Loading data from pickle...")
+            with open(pickle_path, "rb") as f:
+                accumulated_data = pickle.load(f)
+        else:
+            print("Pickle file not found. Set RUN_PROCESS = True.")
 
-### Save as pickle variable ************** VOLVER A GENERAR EL ARCHIVO 2022 QUE SE SOBREESCRIBIÓ
-pickle.dump(cumsum_w_nan, open(folder+"\Data\pickle_MSWEP\MSWEP_Cumul_pcp_2019-2023.p", "wb" ) )
-# cumsum_w_nan = pickle.load(open(folder+"\Data\pickle_MSWEP\MSWEP_Cumul_pcp_2023.p", "rb" ) )
-
-#%% PLOTTING THE DATA
-### Plotting the accumulation map
-fig, ax = plt.subplots(figsize=(12, 12))
-cumsum_w_nan.plot(ax=ax, cmap = 'GnBu', vmin=400, vmax=1600) #Precipitation map
-jubones_proj.boundary.plot(ax=ax, color='black') #Projected shp of the basin
-plt.title('Mapa de precipitación acumulada 2023 (MSWEP)', fontsize=20)
-plt.xlabel('Longitud [grados Este]', fontsize = 18)
-plt.ylabel('Latitude [grados Norte]', fontsize = 18)
-plt.xticks(fontsize = 16)
-plt.yticks(fontsize = 16)
-plt.show()
-print('Precipitación máxima = ',cumsum_w_nan.max().values,'mm')
-print('Precipitación promedio = ',cumsum_w_nan.mean().values,'mm')
-print('Precipitación mínima = ',cumsum_w_nan.min().values,'mm')
-
-
-fig.savefig(r'Results\Cumulative_Pcp_MSWEP\Accum_2023\Accum_pcp_map_MSWEP_2023.png', bbox_inches='tight', pad_inches = 0.1)
-
-    ###Trabajando con DATAFRAMES
-# mean_precip_time = merged_df.groupby('time').mean() #Promedio de P de toda la cuenca por c/ paso de tiempo
-# mean_precip_coord = merged_df.groupby(['lon', 'lat']).mean() #Promedio de P por c/ pixel en todos los pasos de tiempo
-# sum_precip_time = merged_df.groupby('time').sum() #Suma de toda la cuenca por c/ paso de tiempo
-# sum_precip_coord = merged_df.groupby(['lon', 'lat']).sum() #Suma de c/ pixel en todos los pasos de tiempo
-# mean_precip_time.plot(kind='bar', rot=30) #Grafico de precipitacion media de toda la cuenca por c/ paso de tiempo
-# mean_precip_time['precipitation'].cumsum().plot() #P acumulada por c/ paso de tiempo en toda la cuenca
-# mean_precip_coord.plot(kind='bar', rot=30) #Grafico de precipitacion acumulada de c/ pixel para todos los pasos de tiempo
-# mean_precip_coord['precipitation'].cumsum().plot() #P acumulada por c/ pixel para todos los pasos de tiempo
-# mean_p_coord_ds = xr.Dataset.from_dataframe(mean_precip_coord)
-# sum_p_coord_ds = xr.Dataset.from_dataframe(mean_precip_coord)
+    # 3. Plotting
+    if accumulated_data is not None:
+        print(f"Max: {accumulated_data.max().values:.2f} mm")
+        
+        fig, ax = plt.subplots(figsize=(10, 10))
+        accumulated_data.plot(ax=ax, cmap='GnBu', vmin=400, vmax=1600, cbar_kwargs={'label': 'mm'})
+        basin_proj.boundary.plot(ax=ax, color='black')
+        plt.title('MSWEP Cumulative Precipitation', fontsize=16)
+        plt.show()
